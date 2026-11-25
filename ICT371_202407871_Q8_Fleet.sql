@@ -171,34 +171,47 @@ BEGIN
 END;
 $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- Every Monday at 06:00  (cron day-of-week: 1 = Monday)
-SELECT cron.schedule('q8_refresh_service_alerts', '0 6 * * 1',
-                     $$CALL q8_fleet.pr_refresh_service_alerts()$$);
+-- Safe scheduling: runs only if pg_cron is available on this server.
+-- If it is not installed you will just see a NOTICE and the rest of the script still works.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+        PERFORM cron.schedule('q8_refresh_service_alerts', '0 6 * * 1', $cmd$CALL q8_fleet.pr_refresh_service_alerts()$cmd$);
+        RAISE NOTICE 'Job q8_refresh_service_alerts scheduled: 0 6 * * 1';
+    ELSE
+        RAISE NOTICE 'pg_cron is not installed on this server - job NOT scheduled. Schedule used: 0 6 * * 1';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule job (q8_refresh_service_alerts): %', SQLERRM;
+END
+$do$;
 
-SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q8_refresh_service_alerts';
+-- Inspect job / history (uncomment where pg_cron is installed):
+-- SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q8_refresh_service_alerts';
 -- SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
 
 -- =====================================================================
 -- TESTS / EVIDENCE
 -- =====================================================================
-\echo '--- (a) Data ---'
+SELECT '--- (a) Data ---' AS section;
 SELECT * FROM vehicles ORDER BY vehicle_id;      -- odometers: 14900, 25500, 5200
 SELECT * FROM trips ORDER BY trip_id;
 
-\echo '--- (b) Function ---'
+SELECT '--- (b) Function ---' AS section;
 SELECT vehicle_id, fn_service_due(vehicle_id) FROM vehicles ORDER BY vehicle_id;   -- f, t, t
 DO $$ BEGIN PERFORM fn_service_due(999);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown vehicle): %', SQLERRM; END $$;
 
-\echo '--- (c) Procedure ---'
+SELECT '--- (c) Procedure ---' AS section;
 DO $$ BEGIN CALL pr_record_trip(999, CURRENT_DATE, 0, 10);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown vehicle): %', SQLERRM; END $$;
 DO $$ BEGIN CALL pr_record_trip(1, CURRENT_DATE, 14900, 14900);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (end not > start): %', SQLERRM; END $$;
 
-\echo '--- (d) Trigger: wrong start rejected; odometer updated exactly once ---'
+SELECT '--- (d) Trigger: wrong start rejected; odometer updated exactly once ---' AS section;
 DO $$ BEGIN CALL pr_record_trip(1, CURRENT_DATE, 14000, 14100);        -- should start at 14900
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (start mismatch): %', SQLERRM; END $$;
 DO $$ BEGIN INSERT INTO trips (vehicle_id, trip_on, start_odometer, end_odometer)
@@ -208,16 +221,16 @@ SELECT vehicle_id, current_odometer FROM vehicles WHERE vehicle_id = 1;   -- sti
 CALL pr_record_trip(1, CURRENT_DATE, 14900, 15000);
 SELECT vehicle_id, current_odometer FROM vehicles WHERE vehicle_id = 1;   -- exactly 15000 (+100, not +200)
 
-\echo '--- (e) View ---'
+SELECT '--- (e) View ---' AS section;
 SELECT * FROM v_service_due ORDER BY registration;         -- ABC 1001 (5000), ABC 1002 (6500), ABC 1003 (5200)
 
-\echo '--- (f) EXPLAIN ---'
+SELECT '--- (f) EXPLAIN ---' AS section;
 SET enable_seqscan = off;
 EXPLAIN SELECT * FROM trips
 WHERE vehicle_id = 2 AND trip_on BETWEEN CURRENT_DATE - 30 AND CURRENT_DATE;
 RESET enable_seqscan;
 
-\echo '--- (g) Scheduled procedure: insert, update, remove ---'
+SELECT '--- (g) Scheduled procedure: insert, update, remove ---' AS section;
 CALL pr_refresh_service_alerts();
 SELECT * FROM service_alerts ORDER BY vehicle_id;          -- 3 alerts
 UPDATE vehicles SET last_service_odometer = current_odometer WHERE vehicle_id = 2;   -- vehicle 2 serviced
